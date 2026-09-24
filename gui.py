@@ -167,6 +167,21 @@ class LocalLLMApp:
             text="Limpar",
             command=self._clear_output
         ).pack(side=tk.LEFT, padx=5)
+
+        # Liga/desliga o modo de raciocínio (thinking) direto na tela do chat
+        self.thinking_var = tk.BooleanVar(value=self.settings['enable_thinking'])
+        ttk.Checkbutton(
+            control_frame,
+            text="Raciocínio",
+            variable=self.thinking_var,
+            command=lambda: self.settings.update(enable_thinking=self.thinking_var.get())
+        ).pack(side=tk.LEFT, padx=(15, 2))
+        ttk.Label(
+            control_frame,
+            text="(respostas mais elaboradas, porém mais lentas)",
+            foreground='gray',
+            font=('Arial', 8)
+        ).pack(side=tk.LEFT)
         
         ttk.Button(
             control_frame,
@@ -681,13 +696,6 @@ class SettingsWindow:
             variable=self.use_cache_var
         ).grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=10)
 
-        # Modo de raciocínio (thinking)
-        self.thinking_var = tk.BooleanVar(value=self.settings['enable_thinking'])
-        ttk.Checkbutton(
-            inference_frame,
-            text="Modo de raciocínio (mais inteligente, demora mais para começar a responder)",
-            variable=self.thinking_var
-        ).grid(row=5, column=0, columnspan=3, sticky=tk.W, pady=5)
 
         inference_frame.columnconfigure(1, weight=1)
         
@@ -734,7 +742,6 @@ class SettingsWindow:
         self.settings['max_tokens'] = self.max_tokens_var.get()
         self.settings['repeat_penalty'] = self.repeat_penalty_var.get()
         self.settings['use_cache'] = self.use_cache_var.get()
-        self.settings['enable_thinking'] = self.thinking_var.get()
 
         # Parse stop tokens
         stop_text = self.stop_tokens_text.get('1.0', tk.END).strip()
@@ -754,6 +761,5 @@ class SettingsWindow:
             self.max_tokens_var.set(defaults['max_tokens'])
             self.repeat_penalty_var.set(defaults['repeat_penalty'])
             self.use_cache_var.set(defaults['use_cache'])
-            self.thinking_var.set(defaults['enable_thinking'])
             self.stop_tokens_text.delete('1.0', tk.END)
             self.stop_tokens_text.insert('1.0', '\n'.join(defaults['stop_tokens']))
