@@ -208,3 +208,6 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Configuração local (caminhos desta máquina); use config.example.env como base
+config.env

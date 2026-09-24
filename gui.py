@@ -6,6 +6,7 @@ import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox, filedialog
 import threading
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 import json
@@ -14,6 +15,25 @@ from datetime import datetime
 from model_manager import ModelManager
 from inferencer import LLMInferencer
 from utils import hash_prompt, load_cache, save_cache
+
+
+def default_settings() -> dict:
+    """Configurações de inferência padrão, lidas do config.env quando definidas."""
+    def env(name, default, cast):
+        try:
+            return cast(os.getenv(name, default))
+        except ValueError:
+            return default
+
+    return {
+        'temperature': env('DEFAULT_TEMPERATURE', 0.6, float),
+        'top_p': env('DEFAULT_TOP_P', 0.95, float),
+        'max_tokens': env('DEFAULT_MAX_TOKENS', 4096, int),
+        'repeat_penalty': env('DEFAULT_REPEAT_PENALTY', 1.0, float),
+        'stop_tokens': [],
+        'use_cache': True,
+        'enable_thinking': os.getenv('ENABLE_THINKING', 'true').lower() in ('1', 'true', 'yes'),
+    }
 
 
 class LocalLLMApp:
@@ -29,21 +49,16 @@ class LocalLLMApp:
         self.inferencer: Optional[LLMInferencer] = None
         self.is_generating = False
         self.stop_generation = False
+        self.last_stats = ""
         self.current_conversation = []
         self.initial_model_path = initial_model_path
         
-        # Configurações padrão
-        self.settings = {
-            'temperature': 0.7,
-            'top_p': 0.9,
-            'max_tokens': 512,
-            'repeat_penalty': 1.1,
-            'stop_tokens': ['</s>', '\n\n\n'],
-            'use_cache': True,
-        }
-        
+        # Configurações padrão (valores recomendados para Qwen3.x)
+        self.settings = default_settings()
+
         self._setup_ui()
         self._setup_menu()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         
         # Se model_path foi fornecido, tentar carregar
         if initial_model_path:
@@ -110,6 +125,7 @@ class LocalLLMApp:
         self.output_text.tag_config('user', foreground='blue', font=('Consolas', 10, 'bold'))
         self.output_text.tag_config('assistant', foreground='green')
         self.output_text.tag_config('system', foreground='gray', font=('Consolas', 9, 'italic'))
+        self.output_text.tag_config('reasoning', foreground='#888888', font=('Consolas', 9))
         
         # Área de entrada (prompt do usuário)
         input_frame = ttk.Frame(right_frame)
@@ -184,7 +200,7 @@ class LocalLLMApp:
         file_menu.add_command(label="Configurações...", 
                              command=self._open_settings)
         file_menu.add_separator()
-        file_menu.add_command(label="Sair", command=self.root.quit)
+        file_menu.add_command(label="Sair", command=self._on_close)
         
         # Menu Ferramentas
         tools_menu = tk.Menu(menubar, tearoff=0)
@@ -247,6 +263,10 @@ class LocalLLMApp:
                     ):
                         raise ValueError("Carregamento cancelado pelo usuário")
                 
+                # Encerrar modelo anterior (se houver) antes de subir o novo
+                if self.inferencer:
+                    self.inferencer.unload_model()
+
                 # Criar inferencer e carregar modelo
                 self.inferencer = LLMInferencer(self.model_manager)
                 self.inferencer.load_model()
@@ -270,7 +290,8 @@ class LocalLLMApp:
         info_text = (
             f"✓ {model_name} "
             f"({model_info['size_mb']:.0f} MB, "
-            f"~{model_info['estimated_ram_mb']:.0f} MB RAM)"
+            f"~{model_info['estimated_ram_mb']:.0f} MB RAM, "
+            f"contexto {self.inferencer.get_context_size()} tokens)"
         )
         
         self.model_info_label.config(text=info_text, foreground="green")
@@ -332,16 +353,26 @@ class LocalLLMApp:
         self.stop_button.config(state=tk.NORMAL)
         self.is_generating = True
         self.stop_generation = False
+        self.last_stats = ""
         
-        # Verificar cache
-        cache_key = hash_prompt(user_input, self.settings)
+        # Histórico completo vai para o modelo (só o texto final, sem o raciocínio)
+        messages = [
+            {'role': m['role'], 'content': m['content']}
+            for m in self.current_conversation
+        ]
+
+        # Verificar cache (a chave inclui todo o histórico e o modo de raciocínio)
+        cache_key = hash_prompt(
+            json.dumps([messages, self.settings['enable_thinking']], ensure_ascii=False),
+            self.settings
+        )
         cached_response = None
-        
+
         if self.settings['use_cache']:
             cached_response = load_cache(cache_key)
             if cached_response:
                 logging.info("Resposta encontrada no cache")
-        
+
         # Gerar resposta em thread separada
         def generate_thread():
             try:
@@ -352,20 +383,37 @@ class LocalLLMApp:
                 else:
                     # Gerar nova resposta
                     response = ""
-                    for token in self.inferencer.generate_stream(
-                        prompt=user_input,
+                    thinking = False
+                    self.root.after(0, lambda: self._update_status("Gerando..."))
+                    for piece in self.inferencer.generate_stream(
+                        messages=messages,
                         temperature=self.settings['temperature'],
                         top_p=self.settings['top_p'],
                         max_tokens=self.settings['max_tokens'],
                         repeat_penalty=self.settings['repeat_penalty'],
-                        stop=self.settings['stop_tokens']
+                        stop=self.settings['stop_tokens'],
+                        enable_thinking=self.settings['enable_thinking'],
+                        should_stop=lambda: self.stop_generation
                     ):
-                        if self.stop_generation:
-                            break
-                        
-                        response += token
-                        self.root.after(0, lambda t=token: self._append_to_output(t, 'assistant'))
-                    
+                        text = piece['text']
+                        if piece['type'] == 'reasoning':
+                            if not thinking:
+                                thinking = True
+                                self.root.after(0, lambda: self._append_to_output("[pensando]\n", 'system'))
+                            self.root.after(0, lambda t=text: self._append_to_output(t, 'reasoning'))
+                            continue
+
+                        if thinking:
+                            thinking = False
+                            self.root.after(0, lambda: self._append_to_output("\n[resposta]\n", 'system'))
+                        response += text
+                        self.root.after(0, lambda t=text: self._append_to_output(t, 'assistant'))
+
+                    timings = self.inferencer.last_timings
+                    if timings.get('predicted_per_second'):
+                        self.last_stats = (f"{timings['predicted_n']} tokens a "
+                                           f"{timings['predicted_per_second']:.1f} tokens/s")
+
                     # Salvar no cache
                     if self.settings['use_cache'] and not self.stop_generation:
                         save_cache(cache_key, response)
@@ -403,7 +451,14 @@ class LocalLLMApp:
         self.is_generating = False
         self.send_button.config(state=tk.NORMAL)
         self.stop_button.config(state=tk.DISABLED)
-        self._update_status("Pronto")
+        self._update_status(f"Pronto ({self.last_stats})" if self.last_stats else "Pronto")
+
+    def _on_close(self):
+        """Encerra o llama-server junto com a janela."""
+        self.stop_generation = True
+        if self.inferencer:
+            self.inferencer.unload_model()
+        self.root.destroy()
     
     def _append_to_output(self, text: str, tag: str = None):
         """Adiciona texto à área de saída."""
@@ -503,14 +558,14 @@ class LocalLLMApp:
         """Mostra informações sobre o aplicativo."""
         about_text = """
 LocalLLM Desktop Application
-Versão 1.0.0
+Versão 2.0.0
 
 Executando Large Language Models localmente
 com privacidade total.
 
 Desenvolvido com:
 - Python 3.10+
-- llama-cpp-python
+- llama.cpp (llama-server)
 - Tkinter
 
 © 2024 - Software de código aberto
@@ -596,7 +651,7 @@ class SettingsWindow:
         max_tokens_spin = ttk.Spinbox(
             inference_frame,
             from_=50,
-            to=4096,
+            to=32768,
             textvariable=self.max_tokens_var,
             width=10
         )
@@ -625,7 +680,15 @@ class SettingsWindow:
             text="Usar cache de respostas",
             variable=self.use_cache_var
         ).grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=10)
-        
+
+        # Modo de raciocínio (thinking)
+        self.thinking_var = tk.BooleanVar(value=self.settings['enable_thinking'])
+        ttk.Checkbutton(
+            inference_frame,
+            text="Modo de raciocínio (mais inteligente, demora mais para começar a responder)",
+            variable=self.thinking_var
+        ).grid(row=5, column=0, columnspan=3, sticky=tk.W, pady=5)
+
         inference_frame.columnconfigure(1, weight=1)
         
         # === TAB: Avançado ===
@@ -671,7 +734,8 @@ class SettingsWindow:
         self.settings['max_tokens'] = self.max_tokens_var.get()
         self.settings['repeat_penalty'] = self.repeat_penalty_var.get()
         self.settings['use_cache'] = self.use_cache_var.get()
-        
+        self.settings['enable_thinking'] = self.thinking_var.get()
+
         # Parse stop tokens
         stop_text = self.stop_tokens_text.get('1.0', tk.END).strip()
         self.settings['stop_tokens'] = [
@@ -684,10 +748,12 @@ class SettingsWindow:
     def _restore_defaults(self):
         """Restaura configurações padrão."""
         if messagebox.askyesno("Confirmar", "Restaurar configurações padrão?"):
-            self.temp_var.set(0.7)
-            self.top_p_var.set(0.9)
-            self.max_tokens_var.set(512)
-            self.repeat_penalty_var.set(1.1)
-            self.use_cache_var.set(True)
+            defaults = default_settings()
+            self.temp_var.set(defaults['temperature'])
+            self.top_p_var.set(defaults['top_p'])
+            self.max_tokens_var.set(defaults['max_tokens'])
+            self.repeat_penalty_var.set(defaults['repeat_penalty'])
+            self.use_cache_var.set(defaults['use_cache'])
+            self.thinking_var.set(defaults['enable_thinking'])
             self.stop_tokens_text.delete('1.0', tk.END)
-            self.stop_tokens_text.insert('1.0', '</s>\n\n\n')
+            self.stop_tokens_text.insert('1.0', '\n'.join(defaults['stop_tokens']))

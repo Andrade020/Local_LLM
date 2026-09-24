@@ -1,193 +1,247 @@
 """
-Wrapper de inferência para llama-cpp-python
-Gerencia geração de texto com streaming
+Wrapper de inferência sobre o llama-server (llama.cpp)
+Sobe o servidor como subprocesso e conversa via API de chat com streaming
 """
 
+import json
 import logging
-from typing import Iterator, Optional, List
-from llama_cpp import Llama
+import os
+import socket
+import subprocess
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Dict, Iterator, List, Optional
 
 from model_manager import ModelManager
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, default))
+    except ValueError:
+        return default
+
+
 class LLMInferencer:
-    """Wrapper para inferência com llama-cpp-python."""
-    
+    """
+    Executa o modelo com o llama-server.exe do llama.cpp.
+
+    Usar o binário oficial (em vez do llama-cpp-python) dá suporte imediato a
+    arquiteturas novas (ex.: Qwen3.6 MoE), CUDA em GPUs antigas (Pascal) e
+    offload de experts MoE para a CPU (--n-cpu-moe).
+    """
+
     def __init__(self, model_manager: ModelManager):
         """
         Inicializa o inferencer.
-        
+
         Args:
             model_manager: Instância do ModelManager com modelo validado
         """
         self.model_manager = model_manager
-        self.llm: Optional[Llama] = None
+        self.process: Optional[subprocess.Popen] = None
+        self.port: Optional[int] = None
+        self.n_ctx = 0
         self.is_loaded = False
-        
+        self.last_timings: Dict = {}
+        self._log_file = None
+
         logging.info("LLMInferencer inicializado")
-    
+
     def load_model(
         self,
-        n_ctx: int = 2048,
+        n_ctx: Optional[int] = None,
         n_threads: Optional[int] = None,
-        n_batch: int = 512,
-        use_mlock: bool = False,
-        verbose: bool = False
+        n_gpu_layers: Optional[int] = None,
+        n_cpu_moe: Optional[int] = None,
+        timeout: int = 600,
     ):
         """
-        Carrega o modelo na memória.
-        
+        Sobe o llama-server com o modelo e espera ele ficar pronto.
+
+        Valores não informados vêm do config.env (N_CTX, N_THREADS,
+        N_GPU_LAYERS, N_CPU_MOE).
+
         Args:
             n_ctx: Tamanho do contexto (tokens)
-            n_threads: Número de threads (None = auto)
-            n_batch: Tamanho do batch para processamento
-            use_mlock: Usar mlock para evitar swap (requer privilégios)
-            verbose: Modo verbose do llama.cpp
+            n_threads: Número de threads da CPU
+            n_gpu_layers: Camadas na GPU (99 = todas)
+            n_cpu_moe: Camadas cujos experts MoE ficam na CPU (0 = nenhuma)
+            timeout: Segundos máximos esperando o servidor subir
         """
-        model_path = str(self.model_manager.model_path)
-        
-        logging.info(f"Carregando modelo: {model_path}")
-        logging.info(f"Parâmetros: n_ctx={n_ctx}, n_threads={n_threads}, n_batch={n_batch}")
-        
-        try:
-            # Criar instância do Llama
-            self.llm = Llama(
-                model_path=model_path,
-                n_ctx=n_ctx,
-                n_threads=n_threads,
-                n_batch=n_batch,
-                use_mlock=use_mlock,
-                verbose=verbose,
-                # Otimizações para CPU
-                n_gpu_layers=0,  # Não usar GPU
-                f16_kv=True,  # Usar FP16 para cache K/V (economiza RAM)
+        server = Path(os.getenv('LLAMA_SERVER_PATH', 'llama-server.exe'))
+        if not server.exists():
+            raise FileNotFoundError(
+                f"llama-server não encontrado em: {server}\n"
+                f"Configure LLAMA_SERVER_PATH no config.env."
             )
-            
-            self.is_loaded = True
-            logging.info("Modelo carregado com sucesso!")
-            
-        except Exception as e:
-            self.is_loaded = False
-            logging.error(f"Erro ao carregar modelo: {e}")
-            raise
-    
-    def generate(
-        self,
-        prompt: str,
-        temperature: float = 0.7,
-        top_p: float = 0.9,
-        max_tokens: int = 512,
-        repeat_penalty: float = 1.1,
-        stop: Optional[List[str]] = None
-    ) -> str:
-        """
-        Gera texto de forma não-streaming.
-        
-        Args:
-            prompt: Texto de entrada
-            temperature: Controla aleatoriedade (0.0 = determinístico, 2.0 = muito aleatório)
-            top_p: Nucleus sampling (0.0-1.0)
-            max_tokens: Máximo de tokens a gerar
-            repeat_penalty: Penalidade para repetição (>1.0 = menos repetição)
-            stop: Lista de sequências que param a geração
-            
-        Returns:
-            Texto gerado
-        """
-        if not self.is_loaded:
-            raise RuntimeError("Modelo não carregado. Chame load_model() primeiro.")
-        
-        logging.debug(f"Gerando resposta para prompt: {prompt[:50]}...")
-        
-        try:
-            output = self.llm(
-                prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                repeat_penalty=repeat_penalty,
-                stop=stop or [],
-                echo=False  # Não incluir prompt na saída
-            )
-            
-            # Extrair texto da resposta
-            text = output['choices'][0]['text']
-            
-            logging.debug(f"Resposta gerada: {len(text)} caracteres")
-            return text
-            
-        except Exception as e:
-            logging.error(f"Erro na geração: {e}")
-            raise
-    
+
+        self.n_ctx = n_ctx or _env_int('N_CTX', 8192)
+        n_threads = n_threads or _env_int('N_THREADS', os.cpu_count() or 4)
+        n_gpu_layers = n_gpu_layers if n_gpu_layers is not None else _env_int('N_GPU_LAYERS', 0)
+        n_cpu_moe = n_cpu_moe if n_cpu_moe is not None else _env_int('N_CPU_MOE', 0)
+        self.port = self._free_port()
+
+        cmd = [
+            str(server),
+            '-m', str(self.model_manager.model_path),
+            '--host', '127.0.0.1',
+            '--port', str(self.port),
+            '-c', str(self.n_ctx),
+            '-t', str(n_threads),
+            '-ngl', str(n_gpu_layers),
+            '-fa', 'on',
+            '-np', '1',
+            '--no-webui',
+        ]
+        if n_cpu_moe > 0:
+            cmd += ['--n-cpu-moe', str(n_cpu_moe)]
+        cmd += os.getenv('LLAMA_SERVER_EXTRA_ARGS', '').split()
+
+        Path('logs').mkdir(exist_ok=True)
+        self._log_file = open(Path('logs') / 'llama-server.log', 'w', encoding='utf-8')
+        logging.info(f"Iniciando llama-server: {' '.join(cmd)}")
+
+        self.process = subprocess.Popen(
+            cmd,
+            stdout=self._log_file,
+            stderr=subprocess.STDOUT,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+        )
+
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            if self.process.poll() is not None:
+                self._cleanup()
+                raise RuntimeError(
+                    "O llama-server encerrou durante o carregamento.\n"
+                    f"Últimas linhas do log:\n{self._log_tail()}"
+                )
+            if self._healthy():
+                self.is_loaded = True
+                logging.info(f"Modelo carregado em {time.time() - t0:.1f}s (porta {self.port})")
+                return
+            time.sleep(1)
+
+        self.unload_model()
+        raise TimeoutError(f"O llama-server não ficou pronto em {timeout}s")
+
     def generate_stream(
         self,
-        prompt: str,
-        temperature: float = 0.7,
-        top_p: float = 0.9,
-        max_tokens: int = 512,
-        repeat_penalty: float = 1.1,
-        stop: Optional[List[str]] = None
-    ) -> Iterator[str]:
+        messages: List[Dict[str, str]],
+        temperature: float = 0.6,
+        top_p: float = 0.95,
+        max_tokens: int = 4096,
+        repeat_penalty: float = 1.0,
+        stop: Optional[List[str]] = None,
+        enable_thinking: bool = True,
+        should_stop=lambda: False,
+    ) -> Iterator[Dict[str, str]]:
         """
-        Gera texto com streaming (token por token).
-        
+        Gera a resposta do chat com streaming.
+
         Args:
-            prompt: Texto de entrada
+            messages: Histórico no formato [{'role': 'user'|'assistant', 'content': ...}]
             temperature: Controla aleatoriedade
             top_p: Nucleus sampling
-            max_tokens: Máximo de tokens a gerar
+            max_tokens: Máximo de tokens a gerar (inclui o raciocínio)
             repeat_penalty: Penalidade para repetição
             stop: Lista de sequências que param a geração
-            
+            enable_thinking: Liga o modo de raciocínio (modelos Qwen3.x)
+            should_stop: Função checada a cada token; True interrompe a geração
+
         Yields:
-            Tokens individuais conforme são gerados
+            {'type': 'reasoning' | 'content', 'text': trecho}
         """
         if not self.is_loaded:
             raise RuntimeError("Modelo não carregado. Chame load_model() primeiro.")
-        
-        logging.debug(f"Gerando resposta (streaming) para prompt: {prompt[:50]}...")
-        
-        try:
-            # Criar gerador com streaming
-            stream = self.llm(
-                prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                repeat_penalty=repeat_penalty,
-                stop=stop or [],
-                echo=False,
-                stream=True  # Habilitar streaming
-            )
-            
-            # Iterar sobre tokens
-            for output in stream:
-                # Extrair texto do token
-                token = output['choices'][0]['text']
-                yield token
-                
-        except Exception as e:
-            logging.error(f"Erro na geração (streaming): {e}")
-            raise
-    
+
+        payload = {
+            'messages': messages,
+            'stream': True,
+            'max_tokens': max_tokens,
+            'temperature': temperature,
+            'top_p': top_p,
+            'top_k': 20,
+            'repeat_penalty': repeat_penalty,
+            'chat_template_kwargs': {'enable_thinking': enable_thinking},
+            'timings_per_token': False,
+        }
+        if stop:
+            payload['stop'] = stop
+
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/v1/chat/completions",
+            data=json.dumps(payload).encode('utf-8'),
+            headers={'Content-Type': 'application/json'},
+        )
+        self.last_timings = {}
+
+        # Fechar a conexão (saindo do with) faz o servidor cancelar a geração
+        with urllib.request.urlopen(req, timeout=3600) as resp:
+            for raw in resp:
+                if should_stop():
+                    break
+                line = raw.decode('utf-8').strip()
+                if not line.startswith('data:'):
+                    continue
+                data = line[5:].strip()
+                if data == '[DONE]':
+                    break
+                chunk = json.loads(data)
+                if chunk.get('timings'):
+                    self.last_timings = chunk['timings']
+                for choice in chunk.get('choices', []):
+                    delta = choice.get('delta') or {}
+                    if delta.get('reasoning_content'):
+                        yield {'type': 'reasoning', 'text': delta['reasoning_content']}
+                    if delta.get('content'):
+                        yield {'type': 'content', 'text': delta['content']}
+
     def unload_model(self):
-        """Descarrega o modelo da memória."""
-        if self.llm is not None:
-            logging.info("Descarregando modelo...")
-            del self.llm
-            self.llm = None
-            self.is_loaded = False
-            logging.info("Modelo descarregado")
-    
+        """Encerra o llama-server e libera a memória."""
+        if self.process is not None:
+            logging.info("Encerrando llama-server...")
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+        self._cleanup()
+        logging.info("Modelo descarregado")
+
     def get_context_size(self) -> int:
         """Retorna o tamanho do contexto do modelo."""
-        if not self.is_loaded:
-            return 0
-        return self.llm.n_ctx()
-    
-    def reset_context(self):
-        """Reseta o contexto do modelo (limpa histórico)."""
-        if self.is_loaded and self.llm is not None:
-            self.llm.reset()
-            logging.info("Contexto resetado")
+        return self.n_ctx if self.is_loaded else 0
+
+    def _cleanup(self):
+        self.process = None
+        self.is_loaded = False
+        if self._log_file:
+            self._log_file.close()
+            self._log_file = None
+
+    def _healthy(self) -> bool:
+        try:
+            url = f"http://127.0.0.1:{self.port}/health"
+            with urllib.request.urlopen(url, timeout=2) as r:
+                return r.status == 200
+        except (urllib.error.URLError, OSError):
+            return False
+
+    @staticmethod
+    def _free_port() -> int:
+        with socket.socket() as s:
+            s.bind(('127.0.0.1', 0))
+            return s.getsockname()[1]
+
+    @staticmethod
+    def _log_tail(n: int = 15) -> str:
+        try:
+            lines = (Path('logs') / 'llama-server.log').read_text(
+                encoding='utf-8', errors='replace').splitlines()
+            return '\n'.join(lines[-n:])
+        except OSError:
+            return '(log indisponível)'

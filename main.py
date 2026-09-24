@@ -46,23 +46,11 @@ def parse_arguments():
 def check_dependencies():
     """Verifica se todas as dependências estão instaladas."""
     try:
-        import llama_cpp
-        logging.info(f"llama-cpp-python version: {llama_cpp.__version__}")
+        import psutil  # noqa: F401
     except ImportError:
-        print("\n" + "="*70)
-        print("ERRO: llama-cpp-python não está instalado!")
-        print("="*70)
-        print("\nPara instalar, execute um dos seguintes comandos:\n")
-        print("  # Instalação padrão (CPU):")
-        print("  pip install llama-cpp-python\n")
-        print("  # Para melhor performance (requer CMake e compilador C++):")
-        print("  CMAKE_ARGS=\"-DLLAMA_BLAS=ON\" pip install llama-cpp-python\n")
-        print("  # Se você tem GPU NVIDIA (CUDA):")
-        print("  CMAKE_ARGS=\"-DLLAMA_CUBLAS=ON\" pip install llama-cpp-python\n")
-        print("Consulte: https://github.com/abetlen/llama-cpp-python")
-        print("="*70 + "\n")
+        print("\nERRO: dependências faltando. Execute: pip install -r requirements.txt\n")
         sys.exit(1)
-    
+
     try:
         import tkinter
     except ImportError:
@@ -91,7 +79,7 @@ def main():
     
     # Verificar dependências
     check_dependencies()
-    
+
     # Carregar configurações do arquivo .env
     config_file = args.config
     if os.path.exists(config_file):
@@ -100,6 +88,13 @@ def main():
     else:
         logging.warning(f"Arquivo de configuração não encontrado: {config_file}")
         logging.info("Usando configurações padrão")
+
+    server_path = os.getenv('LLAMA_SERVER_PATH', '')
+    if not server_path or not os.path.exists(server_path):
+        logging.warning(
+            f"llama-server não encontrado ('{server_path}'). Baixe o llama.cpp em "
+            "https://github.com/ggml-org/llama.cpp/releases e configure LLAMA_SERVER_PATH."
+        )
     
     # Verificar requisitos do sistema
     requirements_met, warnings = check_system_requirements()

@@ -4,7 +4,9 @@ Validação, verificação de memória e carregamento
 """
 
 import os
+import re
 import logging
+import subprocess
 from pathlib import Path
 from typing import Tuple, Dict
 import psutil
@@ -63,16 +65,9 @@ class ModelManager:
         }
         
         # Estimar uso de RAM (heurística)
-        # Modelos quantizados usam ~1.2-1.5x seu tamanho em RAM
-        # Modelos não quantizados usam ~2-3x
-        if 'q4' in self.model_path.name.lower() or 'q5' in self.model_path.name.lower():
-            multiplier = 1.3
-        elif 'q8' in self.model_path.name.lower():
-            multiplier = 1.5
-        else:
-            multiplier = 2.0
-        
-        self.model_info['estimated_ram_mb'] = size_mb * multiplier
+        # O llama.cpp mapeia o GGUF direto na memória (mmap): o uso é ~o tamanho
+        # do arquivo + contexto/buffers. A parte que vai para a GPU sai da RAM.
+        self.model_info['estimated_ram_mb'] = size_mb * 1.1
         
         logging.info(f"Modelo validado: {self.model_info}")
         return True, "Modelo válido"
@@ -97,30 +92,40 @@ class ModelManager:
         )
         logging.info(f"Modelo requer ~{estimated_ram:.0f} MB")
         
-        # Verificar se há memória suficiente (com margem de segurança)
-        safety_margin_mb = 2048  # 2 GB de margem
-        required_mb = estimated_ram + safety_margin_mb
-        
-        if available_mb < required_mb:
+        # Com mmap o Windows libera cache sob demanda, então o limite real é a RAM
+        # total (menos ~1 GB do sistema), somada ao que couber na GPU.
+        limit_mb = total_mb + self._gpu_memory_mb() - 1024
+
+        if estimated_ram > limit_mb:
             message = (
-                f"⚠️ AVISO: Memória pode ser insuficiente!\n\n"
-                f"Disponível: {available_mb:.0f} MB\n"
-                f"Necessário: ~{required_mb:.0f} MB\n"
-                f"(Modelo: {estimated_ram:.0f} MB + Margem: {safety_margin_mb} MB)\n\n"
-                f"O sistema pode ficar lento ou travar."
+                f"⚠️ AVISO: o modelo provavelmente não cabe na memória!\n\n"
+                f"RAM total + VRAM: {limit_mb + 1024:.0f} MB\n"
+                f"Modelo: ~{estimated_ram:.0f} MB\n\n"
+                f"O sistema pode ficar muito lento ou travar."
             )
             return False, message
-        
-        # Avisar se RAM total é baixa
-        if total_mb < 16384:  # Menos de 16 GB
+
+        if estimated_ram > available_mb:
             message = (
-                f"ℹ️ Sistema com {total_mb:.0f} MB RAM total.\n"
-                f"Recomendado: 16 GB ou mais para modelos maiores.\n"
-                f"Considere usar modelos menores (7B quantizados)."
+                f"ℹ️ Memória livre agora: {available_mb:.0f} MB; o modelo usa ~{estimated_ram:.0f} MB.\n"
+                f"Feche programas pesados (navegador, jogos) para manter a velocidade."
             )
             return True, message
-        
+
         return True, f"Memória suficiente: {available_mb:.0f} MB disponível"
+
+    @staticmethod
+    def _gpu_memory_mb() -> float:
+        """VRAM total da GPU NVIDIA (0 se não houver ou se não der para consultar)."""
+        try:
+            out = subprocess.run(
+                ['nvidia-smi', '--query-gpu=memory.total', '--format=csv,noheader,nounits'],
+                capture_output=True, text=True, timeout=5,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+            )
+            return float(out.stdout.split()[0])
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+            return 0.0
     
     def get_model_info(self) -> Dict:
         """Retorna informações do modelo."""
@@ -134,22 +139,20 @@ class ModelManager:
             String descrevendo a quantização
         """
         name_lower = self.model_path.name.lower()
-        
-        quant_types = {
-            'q4_0': '4-bit (menor, mais rápido, menos preciso)',
-            'q4_1': '4-bit (balanceado)',
-            'q5_0': '5-bit (bom balanço)',
-            'q5_1': '5-bit (melhor qualidade)',
-            'q8_0': '8-bit (alta qualidade, mais lento)',
-            'f16': '16-bit float (muito preciso, muito lento)',
-            'f32': '32-bit float (precisão máxima, extremamente lento)',
-        }
-        
-        for quant_key, description in quant_types.items():
-            if quant_key in name_lower:
-                return f"Quantização: {quant_key.upper()} - {description}"
-        
-        return "Quantização: Desconhecida (verifique o nome do arquivo)"
+
+        match = re.search(r'(iq\d_[a-z0-9]+|q\d_k_[a-z]+|q\d_k|q\d_\d|mxfp4|bf16|f16|f32)', name_lower)
+        if not match:
+            return "Quantização: Desconhecida (verifique o nome do arquivo)"
+
+        quant = match.group(1)
+        if quant in ('bf16', 'f16', 'f32'):
+            description = 'sem quantização (preciso, pesado e lento)'
+        elif quant == 'mxfp4':
+            description = '4-bit em ponto flutuante'
+        else:
+            bits = int(re.search(r'\d', quant).group())
+            description = f'~{bits}-bit' + (' (i-quant: melhor qualidade por bit)' if quant.startswith('iq') else '')
+        return f"Quantização: {quant.upper()} - {description}"
     
     @staticmethod
     def suggest_model_size(available_ram_mb: float) -> str:
